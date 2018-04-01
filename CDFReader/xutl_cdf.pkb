@@ -557,6 +557,19 @@ create or replace package body xutl_cdf is
     end if;
   end;
 
+  function stream_exists (
+    p_hdl   in cdf_handle
+  , p_path  in varchar2
+  )
+  return boolean
+  is
+  begin
+    if not cdf_cache.exists(p_hdl) then
+      raise_application_error(-20701, ERR_INVALID_HANDLE);
+    end if;
+    return cdf_cache(p_hdl).dir_map.exists(p_path);
+  end;
+
   function get_stream (
     p_hdl    in cdf_handle
   , p_path   in varchar2

@@ -3,7 +3,7 @@ create or replace package xutl_cdf is
 
   MIT License
 
-  Copyright (c) 2017 Marc Bleron
+  Copyright (c) 2017,2018 Marc Bleron
 
   Permission is hereby granted, free of charge, to any person obtaining a copy
   of this software and associated documentation files (the "Software"), to deal
@@ -28,6 +28,7 @@ create or replace package xutl_cdf is
     Marc Bleron       2017-05-08     Creation
     Marc Bleron       2017-05-25     Fixed get_stream offset bug
                                      Refactored exception numbers
+    Marc Bleron       2018-02-15     Added stream_exists() function
 ====================================================================================== */
 
   invalid_handle   exception;
@@ -55,6 +56,12 @@ create or replace package xutl_cdf is
 
   function open_file (p_file in blob)
   return cdf_handle;
+  
+  function stream_exists (
+    p_hdl   in cdf_handle
+  , p_path  in varchar2
+  )
+  return boolean; 
   
   function get_stream (
     p_hdl    in cdf_handle
