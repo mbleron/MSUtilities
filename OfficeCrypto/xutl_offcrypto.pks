@@ -27,6 +27,7 @@ create or replace package xutl_offcrypto is
     Change history :
     Marc Bleron       2017-05-24     Creation
     Marc Bleron       2018-02-03     RC4 routines for .xls files
+    Marc Bleron       2018-05-27     Crypto routines for ODF files
 ====================================================================================== */
 
   invalid_cdf               exception;
@@ -79,6 +80,13 @@ create or replace package xutl_offcrypto is
   function get_package (
     p_file      in blob
   , p_password  in varchar2
+  )
+  return blob;
+
+  function get_part_ODF (
+    encryptedPart in blob
+  , XMLEncData    in xmltype
+  , password      in varchar2
   )
   return blob;
   

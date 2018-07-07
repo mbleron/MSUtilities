@@ -17,10 +17,12 @@ create or replace package body xutl_offcrypto is
   ERR_AES_KEYSIZE   constant varchar2(128) := 'Unsupported AES key size : %s';
   ERR_CIPHER_ALG    constant varchar2(128) := 'Unsupported cipher algorithm : %s';
   ERR_HASH_ALG      constant varchar2(128) := 'Unsupported hash algorithm : %s';
+  ERR_HASH_ALG_CHK  constant varchar2(128) := 'Unsupported checksum type : %s';
   ERR_CIPHER_CHAIN  constant varchar2(128) := 'Unsupported cipher chaining mode : %s';
   ERR_CS_PROVIDER   constant varchar2(128) := 'Unsupported crypto service provider';
   ERR_ENC_METHOD    constant varchar2(128) := 'Unsupported encryption method';
   ERR_ENC_VERSION   constant varchar2(128) := 'Unsupported encryption version : %s';
+  ERR_KD_ALG        constant varchar2(128) := 'Unsupported key-derivation algorithm : %s';
 
   POW16_4           constant integer := 65536; 
   POW16_8           constant integer := 4294967296;
@@ -91,6 +93,19 @@ create or replace package body xutl_offcrypto is
   , encryptedVerifierHash  raw(16)
   );
   
+  type ODF_EncryptionData_t is record (
+    checksum             raw(128)
+  , checksum_type        varchar2(256)
+  , algorithm_iv         raw(128)
+  , algorithm_name       varchar2(256)
+  , key_deriv_salt       raw(128)
+  , key_deriv_iteration  pls_integer
+  , key_deriv_size       pls_integer
+  , key_deriv_name       varchar2(256)
+  , start_key_gen_size   pls_integer
+  , start_key_gen_name   varchar2(256)
+  );
+
   validation_mode  boolean := true;
   debug_mode       boolean := false;
 
@@ -228,6 +243,93 @@ create or replace package body xutl_offcrypto is
     end case;
     return output;
   end;  
+
+  procedure BlowfishDecrypt (
+    input   in blob
+  , key     in raw
+  , iv      in raw
+  , output  in out nocopy blob
+  )
+  as language java name 'db.office.crypto.BlowfishImpl.decrypt(java.sql.Blob, byte[], byte[], java.sql.Blob[])';
+
+  function PBKDF2 (
+    PRF       in pls_integer
+  , password  in raw
+  , salt      in raw
+  , c         in pls_integer
+  , dkLen     in pls_integer
+  )
+  return raw
+  is
+
+    hLen        pls_integer;
+    DK          raw(256);
+    
+    function F (i in pls_integer) return raw is
+      output  raw(20);
+      u       raw(20);
+    begin
+      u := dbms_crypto.Mac(utl_raw.concat(salt, utl_raw.cast_from_binary_integer(i, utl_raw.big_endian)), PRF, password);
+      output := u;
+      for k in 2 .. c loop
+        u := dbms_crypto.Mac(u, dbms_crypto.HMAC_SH1, password);
+        output := utl_raw.bit_xor(output, u);
+      end loop;
+      return output;
+    end;
+    
+  begin
+    
+    hLen := case PRF
+            when dbms_crypto.HMAC_MD5 then 16
+            when dbms_crypto.HMAC_SH1 then 20
+            when dbms_crypto.HMAC_SH256 then 32
+            when dbms_crypto.HMAC_SH384 then 48
+            when dbms_crypto.HMAC_SH512 then 64
+            end;
+    
+    for i in 1 .. ceil(dkLen/hLen) loop
+      DK := utl_raw.concat(DK, F(i));
+    end loop; 
+    DK := utl_raw.substr(DK, 1, dkLen);
+    
+    return DK;   
+  
+  end;
+
+  function inflate (
+    deflateData  in out nocopy blob
+  )
+  return blob
+  is
+    tmp_gz  blob := hextoraw('1F8B08000000000000FF'); -- GZIP header
+    output  blob;   
+    ctx     binary_integer;
+    buf     raw(32767);
+  begin
+    dbms_lob.copy(tmp_gz, deflateData, dbms_lob.getlength(deflateData), 11, 1);    
+    dbms_lob.createtemporary(output, true);
+    
+    -- initialize piecewise uncompress context
+    ctx := utl_compress.lz_uncompress_open(tmp_gz);
+    -- uncompress data in chunks of 32k bytes, until NO_DATA_FOUND is raised
+    loop
+      begin
+        utl_compress.lz_uncompress_extract(ctx, buf);
+      exception
+        when no_data_found then
+          exit;
+      end;
+      dbms_lob.writeappend(output, utl_raw.length(buf), buf);
+    end loop;
+    -- close context
+    utl_compress.lz_uncompress_close(ctx);
+    
+    debug('Uncompressed size = '||dbms_lob.getlength(output));
+    
+    return output;
+    
+  end;
 
   procedure read_BinaryRC4EncInfo (
     stream  in raw
@@ -485,6 +587,55 @@ create or replace package body xutl_offcrypto is
     read_AgileXmlDesc(info);    
   
   end;
+
+  procedure read_ODF_EncryptionData (
+    XMLEncData  in xmltype
+  , encData     in out nocopy ODF_EncryptionData_t
+  )
+  is
+  begin
+
+    select utl_encode.base64_decode(utl_raw.cast_to_raw(checksum)) as checksum
+         , checksum_type
+         , utl_encode.base64_decode(utl_raw.cast_to_raw(algorithm_iv)) as algorithm_iv
+         , algorithm_name
+         , utl_encode.base64_decode(utl_raw.cast_to_raw(key_deriv_salt)) as key_deriv_salt
+         , key_deriv_iteration
+         , nvl(key_deriv_size, 16)
+         , key_deriv_name
+         , nvl(start_key_gen_size, 20)
+         , nvl(start_key_gen_name, 'SHA1')
+    into encData
+    from xmltable(
+           xmlnamespaces(
+             'urn:oasis:names:tc:opendocument:xmlns:manifest:1.0' as "m"
+           , default 'urn:oasis:names:tc:opendocument:xmlns:manifest:1.0'
+           )
+         , '/encryption-data'
+           passing XMLEncData
+           columns checksum             varchar2(128) path '@m:checksum'
+                 , checksum_type        varchar2(256) path '@m:checksum-type'
+                 , algorithm_iv         varchar2(128) path 'algorithm/@m:initialisation-vector'
+                 , algorithm_name       varchar2(256) path 'algorithm/@m:algorithm-name'
+                 , key_deriv_salt       varchar2(128) path 'key-derivation/@m:salt'
+                 , key_deriv_iteration  number        path 'key-derivation/@m:iteration-count'
+                 , key_deriv_size       number        path 'key-derivation/@m:key-size'
+                 , key_deriv_name       varchar2(256) path 'key-derivation/@m:key-derivation-name'
+                 , start_key_gen_size   number        path 'start-key-generation/@m:key-size'
+                 , start_key_gen_name   varchar2(256) path 'start-key-generation/@m:start-key-generation-name'
+         );
+         
+    if encData.key_deriv_name not in (
+      'PBKDF2'
+    , 'urn:oasis:names:tc:opendocument:xmlns:manifest:1.0#pbkdf2'
+    )
+    then
+      error(-20719, ERR_KD_ALG, encData.key_deriv_name);
+    end if;
+    
+    debug(encData.algorithm_name);
+    
+  end;
   
   function get_key_binary_rc4 (
     baseKey   in raw
@@ -495,6 +646,127 @@ create or replace package body xutl_offcrypto is
     blockNumRaw  raw(4) := utl_raw.cast_from_binary_integer(blockNum, utl_raw.little_endian);
   begin
     return utl_raw.substr(dbms_crypto.Hash(utl_raw.concat(baseKey, blockNumRaw), dbms_crypto.HASH_MD5), 1, 16);
+  end;
+
+  function get_key_ODF (
+    encData   in ODF_EncryptionData_t
+  , password  in varchar2
+  )
+  return raw
+  is
+    derivedKey       raw(128);
+    startKeyHashAlg  pls_integer;
+  begin
+    
+    -- Start key generation hash algorithm
+    if encData.start_key_gen_name in ('SHA1','http://www.w3.org/2000/09/xmldsig#sha1') then
+      startKeyHashAlg := dbms_crypto.HASH_SH1;
+    $IF DBMS_DB_VERSION.VERSION >= 12 
+    $THEN
+    elsif encData.start_key_gen_name in ('http://www.w3.org/2000/09/xmldsig#sha256') then
+      startKeyHashAlg := dbms_crypto.HASH_SH256;
+    $END
+    else
+      error(-20714, ERR_HASH_ALG, encData.start_key_gen_name);
+    end if;
+    
+    derivedKey := xutl_crypto.PBKDF2(
+                    PRF      => dbms_crypto.HMAC_SH1
+                  , password => dbms_crypto.Hash(utl_i18n.string_to_raw(password,'AL32UTF8'), startKeyHashAlg)
+                  , salt     => encData.key_deriv_salt
+                  , c        => encData.key_deriv_iteration
+                  , dkLen    => encData.key_deriv_size
+                  );
+
+    return derivedKey;
+    
+  end;
+
+  function get_part_ODF (
+    encryptedPart in blob
+  , XMLEncData    in xmltype
+  , password      in varchar2
+  )
+  return blob
+  is
+    encData          ODF_EncryptionData_t;
+    derivedKey       raw(128);
+    output1          blob; -- compressed (DEFLATE) data
+    output2          blob; -- uncompressed data
+    outputSize       integer;
+    padSize          pls_integer;
+    checksumHashAlg  pls_integer;
+    checksum         raw(128);
+  begin
+    
+    read_ODF_EncryptionData(XMLEncData, encData);
+    derivedKey := get_key_ODF(encData, password);
+    
+    dbms_lob.createtemporary(output1, true);
+    
+    if encData.algorithm_name = 'http://www.w3.org/2001/04/xmlenc#aes256-cbc' then
+      
+      --dbms_lob.createtemporary(output1, true);
+      
+      dbms_crypto.Decrypt(
+        dst => output1
+      , src => encryptedPart
+      , typ => dbms_crypto.ENCRYPT_AES256 + dbms_crypto.CHAIN_CBC + dbms_crypto.PAD_NONE
+      , key => derivedKey
+      , iv  => encData.algorithm_iv
+      );
+      
+      -- W3C padding mode appears to be used (https://www.w3.org/TR/xmlenc-core1/#sec-Padding), 
+      -- which is similar to ISO10126, so padding size is given by the last byte : 
+      outputSize := dbms_lob.getlength(output1);
+      padSize := utl_raw.cast_to_binary_integer(dbms_lob.substr(output1, 1, outputSize));
+      debug('padSize='||padSize);
+      dbms_lob.trim(output1, outputSize - padSize);
+      
+    elsif encData.algorithm_name in ('Blowfish CFB','urn:oasis:names:tc:opendocument:xmlns:manifest:1.0#blowfish') then
+      
+      -- Java method
+      BlowfishDecrypt(encryptedPart, derivedKey, encData.algorithm_iv, output1);
+      /*
+      -- PL/SQL
+      output1 := 
+      xutl_crypto.Blowfish_decrypt(
+        src => encryptedPart
+      , typ => xutl_crypto.CHAIN_CFB + xutl_crypto.PAD_NONE
+      , key => derivedKey
+      , iv  => encData.algorithm_iv
+      );
+      */
+      
+    else
+      error(-20713, ERR_CIPHER_ALG, encData.algorithm_name); 
+    end if;
+    
+    if validation_mode then
+      
+      if encData.checksum_type in ('SHA1/1K','urn:oasis:names:tc:opendocument:xmlns:manifest:1.0#sha1-1k') then
+        checksumHashAlg := dbms_crypto.HASH_SH1;
+      $IF DBMS_DB_VERSION.VERSION >= 12 
+      $THEN
+      elsif encData.checksum_type = 'urn:oasis:names:tc:opendocument:xmlns:manifest:1.0#sha256-1k' then
+        checksumHashAlg := dbms_crypto.HASH_SH256;
+      $END
+      else
+        error(-20714, ERR_HASH_ALG_CHK, encData.checksum_type);
+      end if;
+      
+      checksum := dbms_crypto.Hash(dbms_lob.substr(output1, 1024), checksumHashAlg);
+      if checksum != encData.checksum then
+        error(-20711, ERR_INVALID_PWD);
+      end if;
+      
+    end if;
+    
+    output2 := inflate(output1);
+    dbms_lob.freetemporary(output1);
+  
+    return output2;
+    
   end;
 
   function get_key_binary_rc4_base (
@@ -851,9 +1123,6 @@ create or replace package body xutl_offcrypto is
       -- Unsupported encryption version : %s
       error(-20718, ERR_ENC_VERSION, vFull);
     end if;
-    
-    dbms_lob.freetemporary(stream1);
-    dbms_lob.freetemporary(stream2);
     
     return output;
   
