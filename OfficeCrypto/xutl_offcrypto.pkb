@@ -23,6 +23,7 @@ create or replace package body xutl_offcrypto is
   ERR_ENC_METHOD    constant varchar2(128) := 'Unsupported encryption method';
   ERR_ENC_VERSION   constant varchar2(128) := 'Unsupported encryption version : %s';
   ERR_KD_ALG        constant varchar2(128) := 'Unsupported key-derivation algorithm : %s';
+  ERR_HMAC          constant varchar2(128) := 'Unsupported HMAC algorithm';
 
   POW16_4           constant integer := 65536; 
   POW16_8           constant integer := 4294967296;
@@ -281,12 +282,20 @@ create or replace package body xutl_offcrypto is
   begin
     
     hLen := case PRF
-            when dbms_crypto.HMAC_MD5 then 16
-            when dbms_crypto.HMAC_SH1 then 20
-            when dbms_crypto.HMAC_SH256 then 32
-            when dbms_crypto.HMAC_SH384 then 48
-            when dbms_crypto.HMAC_SH512 then 64
+              when dbms_crypto.HMAC_MD5 then 16
+              when dbms_crypto.HMAC_SH1 then 20
+              $IF DBMS_DB_VERSION.VERSION >= 12 
+              $THEN
+              when dbms_crypto.HMAC_SH256 then 32
+              when dbms_crypto.HMAC_SH384 then 48
+              when dbms_crypto.HMAC_SH512 then 64
+              $END
+              else 0
             end;
+            
+    if hLen = 0 then
+      error(-20714, ERR_HMAC);
+    end if;
     
     for i in 1 .. ceil(dkLen/hLen) loop
       DK := utl_raw.concat(DK, F(i));
@@ -670,7 +679,7 @@ create or replace package body xutl_offcrypto is
       error(-20714, ERR_HASH_ALG, encData.start_key_gen_name);
     end if;
     
-    derivedKey := xutl_crypto.PBKDF2(
+    derivedKey := PBKDF2(
                     PRF      => dbms_crypto.HMAC_SH1
                   , password => dbms_crypto.Hash(utl_i18n.string_to_raw(password,'AL32UTF8'), startKeyHashAlg)
                   , salt     => encData.key_deriv_salt
