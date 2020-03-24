@@ -85,13 +85,26 @@ create or replace package body xutl_offcrypto is
   , hashCache       raw(64)
   );
   
+  type EncryptionVerifier_t is record (
+    saltSize               pls_integer
+  , salt                   raw(16)
+  , encryptedVerifier      raw(16)
+  , verifierHashSize       pls_integer
+  , encryptedVerifierHash  raw(32)
+  );
+  
   type BinaryRC4EncryptionHeader_t is record (
     wEncryptionType        pls_integer
   , vMajor                 pls_integer
-  , vMinor                 pls_integer  
+  , vMinor                 pls_integer
+  , fCryptoAPI             boolean
+  -- RC4
   , saltValue              raw(16)
   , encryptedVerifier      raw(16)
   , encryptedVerifierHash  raw(16)
+  -- RC4 CryptoAPI
+  , keySize                pls_integer
+  , cryptoAPIVerifier      EncryptionVerifier_t
   );
   
   type ODF_EncryptionData_t is record (
@@ -345,32 +358,71 @@ create or replace package body xutl_offcrypto is
   , info    in out nocopy BinaryRC4EncryptionHeader_t
   )
   is
+    pos                   pls_integer := 1;
+    mark                  pls_integer;
+    encryptionHeaderSize  pls_integer;
+    
+    function readBytes(len in pls_integer) return raw is
+      bytes  raw(32767);
+    begin
+      bytes := utl_raw.substr(stream, pos, len);
+      pos := pos + len;
+      return bytes;
+    end;
+    procedure skip(len in pls_integer) is
+    begin
+      pos := pos + len;
+    end;
+  
   begin
        
     -- 0 = XOR, 1 = RC4
-    info.wEncryptionType := to_int32(utl_raw.substr(stream, 1, 2));
+    info.wEncryptionType := to_int32(readBytes(2));
     debug('wEncryptionType = '||info.wEncryptionType);
     
     if info.wEncryptionType = 1 then
     
-      info.vMajor := to_int32(utl_raw.substr(stream, 3, 2));
+      info.vMajor := to_int32(readBytes(2));
       debug('vMajor = '||info.vMajor);
     
-      info.vMinor := to_int32(utl_raw.substr(stream, 5, 2));
+      info.vMinor := to_int32(readBytes(2));
       debug('vMinor = '||info.vMinor);
        
       if info.vMajor = 1 and info.vMinor = 1 then
     
         -- RC4 encryption header structure - [MS-OFFCRYPTO], 2.3.6.1
-        info.saltValue := utl_raw.substr(stream, 7, 16);
+        info.fCryptoAPI := false;
+        
+        info.saltValue := readBytes(16);
         debug('saltValue = '||info.saltValue);  
 
-        info.encryptedVerifier := utl_raw.substr(stream, 23, 16);
+        info.encryptedVerifier := readBytes(16);
         debug('encryptedVerifier = '||info.encryptedVerifier);
         
-        info.encryptedVerifierHash := utl_raw.substr(stream, 39, 16);
+        info.encryptedVerifierHash := readBytes(16);
         debug('encryptedVerifierHash = '||info.encryptedVerifierHash);
         
+      elsif info.vMajor in (2,3,4) and info.vMinor = 2 then
+      
+        -- RC4 CryptoAPI Encryption Header - [MS-OFFCRYPTO], 2.3.5.1
+        info.fCryptoAPI := true;
+        skip(4); -- EncryptionHeader.Flags
+        encryptionHeaderSize := to_int32(readBytes(4));
+        mark := pos; -- mark beginning of EncryptionHeader
+        skip(16); -- skip Flags, SizeExtra, AlgID and AlgIDHash
+        info.keySize := to_int32(readBytes(4))/8;  -- keySize in bytes
+        if info.keySize = 0 then
+          info.keySize := 5; -- 40 bits
+        end if;
+        pos := mark;
+        skip(encryptionHeaderSize); -- skip header
+        -- start reading EncryptionVerifier structure
+        info.cryptoAPIVerifier.saltSize := to_int32(readBytes(4));
+        info.cryptoAPIVerifier.salt := readBytes(16);
+        info.cryptoAPIVerifier.encryptedVerifier := readBytes(16);
+        info.cryptoAPIVerifier.verifierHashSize := to_int32(readBytes(4));
+        info.cryptoAPIVerifier.encryptedVerifierHash := readBytes(20);
+      
       else
         
         error(-20718, ERR_ENC_VERSION, info.vMajor||'.'||info.vMinor);
@@ -647,14 +699,25 @@ create or replace package body xutl_offcrypto is
   end;
   
   function get_key_binary_rc4 (
-    baseKey   in raw
+    keyInfo   in rc4_info_t
   , blockNum  in binary_integer
   )
   return raw
   is
     blockNumRaw  raw(4) := utl_raw.cast_from_binary_integer(blockNum, utl_raw.little_endian);
+    hfinal       raw(20);
+    key          raw(16);
   begin
-    return utl_raw.substr(dbms_crypto.Hash(utl_raw.concat(baseKey, blockNumRaw), dbms_crypto.HASH_MD5), 1, 16);
+    if keyInfo.fCryptoAPI then
+      hfinal := dbms_crypto.Hash(utl_raw.concat(keyInfo.baseKey, blockNumRaw), dbms_crypto.HASH_SH1);
+      key := utl_raw.substr(hfinal, 1, keyInfo.keySize);
+      if keyInfo.keySize = 5 then
+        key := utl_raw.concat(key, utl_raw.copies('00', 11));
+      end if;
+    else
+      key := utl_raw.substr(dbms_crypto.Hash(utl_raw.concat(keyInfo.baseKey, blockNumRaw), dbms_crypto.HASH_MD5), 1, 16);
+    end if;
+    return key;
   end;
 
   function get_key_ODF (
@@ -714,8 +777,6 @@ create or replace package body xutl_offcrypto is
     dbms_lob.createtemporary(output1, true);
     
     if encData.algorithm_name = 'http://www.w3.org/2001/04/xmlenc#aes256-cbc' then
-      
-      --dbms_lob.createtemporary(output1, true);
       
       dbms_crypto.Decrypt(
         dst => output1
@@ -778,51 +839,75 @@ create or replace package body xutl_offcrypto is
     
   end;
 
-  function get_key_binary_rc4_base (
+  function get_binary_rc4_info (
     stream    in raw
   , password  in varchar2
   , validate  in boolean default true
   )
-  return raw
+  return rc4_info_t
   is
   
     info                BinaryRC4EncryptionHeader_t;  
-    encPassword         raw(1024);
+    encPassword         raw(1024) := utl_i18n.string_to_raw(password, 'AL16UTF16LE');
     truncatedHash       raw(5);
     intermediateBuffer  raw(336);
-    baseKey             raw(16);
     derivedKey          raw(16);
     
-    decrypted           raw(32);
-    verifierHash_1      raw(16);
-    verifierHash_2      raw(16);
+    decrypted           raw(36);
+    verifierHash_1      raw(20);
+    verifierHash_2      raw(20);
+    
+    keyInfo             rc4_info_t;
     
   begin
     
     read_BinaryRC4EncInfo(stream, info);
+    
+    keyInfo.fCryptoAPI := info.fCryptoAPI;
 
-    -- 2.3.6.2 Encryption Key Derivation
-    encPassword := utl_i18n.string_to_raw(password, 'AL16UTF16LE');
-    truncatedHash := utl_raw.substr(dbms_crypto.Hash(encPassword, dbms_crypto.HASH_MD5), 1, 5);
-    intermediateBuffer := utl_raw.copies(utl_raw.concat(truncatedHash, info.saltValue), 16);
-    baseKey := utl_raw.substr(dbms_crypto.Hash(intermediateBuffer, dbms_crypto.HASH_MD5), 1, 5);
-    debug('baseKey = '||baseKey);
+    if info.fCryptoAPI then
+      -- 2.3.5.2 RC4 CryptoAPI Encryption Key Generation
+      keyInfo.baseKey := dbms_crypto.Hash(utl_raw.concat(info.cryptoAPIVerifier.salt, encPassword), dbms_crypto.HASH_SH1);
+      keyInfo.keySize := info.keySize;
+    else
+      -- 2.3.6.2 Encryption Key Derivation
+      truncatedHash := utl_raw.substr(dbms_crypto.Hash(encPassword, dbms_crypto.HASH_MD5), 1, 5);
+      intermediateBuffer := utl_raw.copies(utl_raw.concat(truncatedHash, info.saltValue), 16);
+      keyInfo.baseKey := utl_raw.substr(dbms_crypto.Hash(intermediateBuffer, dbms_crypto.HASH_MD5), 1, 5);
+    end if;
+    
+    debug('baseKey = '||keyInfo.baseKey);
     
     -- 2.3.6.4 Password Verification
     if validate then
       
-      derivedKey := get_key_binary_rc4(baseKey, 0);
+      derivedKey := get_key_binary_rc4(keyInfo, 0);
       debug('derivedKey = '||derivedKey);
     
-      -- The RC4 decryption stream MUST NOT be reset between decrypting EncryptedVerifier and EncryptedVerifierHash.
-      decrypted := dbms_crypto.Decrypt(
-                     utl_raw.concat(info.encryptedVerifier, info.encryptedVerifierHash)
-                   , dbms_crypto.ENCRYPT_RC4
-                   , derivedKey
-                   );
+      if info.fCryptoAPI then
+        -- 2.3.5.6
+        -- The RC4 decryption stream MUST NOT be reset between decrypting EncryptedVerifier and EncryptedVerifierHash.
+        decrypted := dbms_crypto.Decrypt(
+                       utl_raw.concat(info.cryptoAPIVerifier.encryptedVerifier, info.cryptoAPIVerifier.encryptedVerifierHash)
+                     , dbms_crypto.ENCRYPT_RC4
+                     , derivedKey
+                     );
+        verifierHash_1 := dbms_crypto.Hash(utl_raw.substr(decrypted,1,16), dbms_crypto.HASH_SH1);
+        verifierHash_2 := utl_raw.substr(decrypted,17,20);
+        
+      else
+        -- 2.3.6.4
+        -- The RC4 decryption stream MUST NOT be reset between decrypting EncryptedVerifier and EncryptedVerifierHash.
+        decrypted := dbms_crypto.Decrypt(
+                       utl_raw.concat(info.encryptedVerifier, info.encryptedVerifierHash)
+                     , dbms_crypto.ENCRYPT_RC4
+                     , derivedKey
+                     );
+        verifierHash_1 := dbms_crypto.Hash(utl_raw.substr(decrypted,1,16), dbms_crypto.HASH_MD5);
+        verifierHash_2 := utl_raw.substr(decrypted,17,16);
+
+      end if;
       
-      verifierHash_1 := dbms_crypto.Hash(utl_raw.substr(decrypted,1,16), dbms_crypto.HASH_MD5);
-      verifierHash_2 := utl_raw.substr(decrypted,17,16);
       debug('verifierHash_1 = '||verifierHash_1);
       debug('verifierHash_2 = '||verifierHash_2);
           
@@ -832,7 +917,7 @@ create or replace package body xutl_offcrypto is
       
     end if;
     
-    return baseKey;
+    return keyInfo;
     
   end;
   
@@ -1097,8 +1182,6 @@ create or replace package body xutl_offcrypto is
   )
   return blob 
   is
-  
-    --hdl      xutl_cdf.cdf_handle;
     stream1  blob;
     stream2  blob;
     output   blob;
@@ -1107,8 +1190,6 @@ create or replace package body xutl_offcrypto is
     vFull    varchar2(10);
     
   begin
-  
-    --hdl := xutl_cdf.open_file(p_file);
     stream1 := xutl_cdf.get_stream(p_cdf_hdl, '/EncryptionInfo');
     stream2 := xutl_cdf.get_stream(p_cdf_hdl, '/EncryptedPackage');
     
@@ -1143,49 +1224,13 @@ create or replace package body xutl_offcrypto is
   )
   return blob 
   is
-  
     hdl      xutl_cdf.cdf_handle;
-    --stream1  blob;
-    --stream2  blob;
-    --output   blob;
-    --vMajor   pls_integer;
-    --vMinor   pls_integer;
-    --vFull    varchar2(10);
-    
-  begin
-    
+  begin    
     if not xutl_cdf.is_cdf(p_file) then
       error(-20710, ERR_NOT_CDF);
     end if;
-  
     hdl := xutl_cdf.open_file(p_file);
-    
-    /*
-    stream1 := xutl_cdf.get_stream(hdl, '/EncryptionInfo');
-    stream2 := xutl_cdf.get_stream(hdl, '/EncryptedPackage');
-    xutl_cdf.close_file(hdl);
-    
-    vMajor := to_int32(dbms_lob.substr(stream1, 2, 1));
-    vMinor := to_int32(dbms_lob.substr(stream1, 2, 3));
-    vFull := to_char(vMajor)||'.'||to_char(vMinor);
-    debug('Encryption version = '||vFull);
-    
-    -- vMajor = 3 : Office 2007 SP1
-    -- vMajor = 4 : Office 2007 SP2, 2010, 2013 
-    -- vMinor = 3 : extensible encryption
-    if vMajor in (3,4) and vMinor = 2 then
-      output := get_pack_standard(stream1, stream2, p_password);
-    elsif vMajor = 4 and vMinor = 4 then
-      output := get_pack_agile(stream1, stream2, p_password);
-    else
-      -- Unsupported encryption version : %s
-      error(-20718, ERR_ENC_VERSION, vFull);
-    end if;
-    
-    return output;
-    */
     return get_package(hdl, p_password);
-  
   end;
 
 end xutl_offcrypto;

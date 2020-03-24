@@ -3,7 +3,7 @@ create or replace package xutl_offcrypto is
 
   MIT License
 
-  Copyright (c) 2017,2018 Marc Bleron
+  Copyright (c) 2017,2020 Marc Bleron
 
   Permission is hereby granted, free of charge, to any person obtaining a copy
   of this software and associated documentation files (the "Software"), to deal
@@ -28,6 +28,7 @@ create or replace package xutl_offcrypto is
     Marc Bleron       2017-05-24     Creation
     Marc Bleron       2018-02-03     RC4 routines for .xls files
     Marc Bleron       2018-05-27     Crypto routines for ODF files
+    Marc Bleron       2020-03-11     Added RC4 CryptoAPI for .xls files
 ====================================================================================== */
 
   invalid_cdf               exception;
@@ -56,19 +57,25 @@ create or replace package xutl_offcrypto is
   
   unsupported_enc_version   exception;
   pragma exception_init (unsupported_enc_version, -20718);
+  
+  type rc4_info_t is record (
+    baseKey     raw(20)
+  , keySize     pls_integer
+  , fCryptoAPI  boolean
+  );
 
   function get_key_binary_rc4 (
-    baseKey   in raw
+    keyInfo   in rc4_info_t
   , blockNum  in binary_integer
   )
   return raw;
-
-  function get_key_binary_rc4_base (
+  
+  function get_binary_rc4_info (
     stream    in raw
   , password  in varchar2
   , validate  in boolean default true
   )
-  return raw;
+  return rc4_info_t;
   
   function get_package (
     p_cdf_hdl   in xutl_cdf.cdf_handle
