@@ -3,7 +3,7 @@ create or replace package xutl_cdf is
 
   MIT License
 
-  Copyright (c) 2017,2018 Marc Bleron
+  Copyright (c) 2017-2020 Marc Bleron
 
   Permission is hereby granted, free of charge, to any person obtaining a copy
   of this software and associated documentation files (the "Software"), to deal
@@ -29,7 +29,12 @@ create or replace package xutl_cdf is
     Marc Bleron       2017-05-25     Fixed get_stream offset bug
                                      Refactored exception numbers
     Marc Bleron       2018-02-15     Added stream_exists() function
+    Marc Bleron       2020-06-02     Added file generation routines
 ====================================================================================== */
+
+  -- File format version
+  V3               constant pls_integer := 0;
+  V4               constant pls_integer := 1;
 
   invalid_handle   exception;
   pragma exception_init(invalid_handle, -20701);
@@ -39,6 +44,9 @@ create or replace package xutl_cdf is
   
   invalid_stream_offset  exception;
   pragma exception_init(invalid_stream_offset, -20703);
+  
+  invalid_dir_entry  exception;
+  pragma exception_init(invalid_stream_offset, -20704);
 
   subtype cdf_handle is pls_integer;
   
@@ -54,8 +62,23 @@ create or replace package xutl_cdf is
   
   function is_cdf (p_file in blob) return boolean;
 
+  function new_file (p_version in pls_integer default V4) 
+  return cdf_handle;
+  
   function open_file (p_file in blob)
   return cdf_handle;
+  
+  procedure write_file (
+    p_hdl        in cdf_handle
+  , p_directory  in varchar2
+  , p_filename   in varchar2
+  );
+  
+  procedure add_stream (
+    p_hdl       in cdf_handle
+  , p_pathname  in varchar2
+  , p_content   in blob
+  );  
   
   function stream_exists (
     p_hdl   in cdf_handle
