@@ -1098,39 +1098,11 @@ create or replace package body xutl_cdf is
     close_file(hdl);    
     return;
   end;
-
-  procedure write_blob (
-    p_directory  in varchar2
-  , p_filename   in varchar2
-  , p_content    in blob
-  )
-  is
-    MAX_BUF_SIZE  constant pls_integer := 32767;
-    file       utl_file.file_type;
-    pos        integer := 1;
-    chunkSize  pls_integer := dbms_lob.getchunksize(p_content);
-    amt        pls_integer := least(trunc(MAX_BUF_SIZE/chunkSize)*chunkSize, MAX_BUF_SIZE);
-    buf        raw(32767);
-  begin
-    file := utl_file.fopen(p_directory, p_filename, 'wb', 32767);
-    loop
-      begin
-        dbms_lob.read(p_content, amt, pos, buf);
-      exception
-        when no_data_found then
-          exit;
-      end;
-      utl_file.put_raw(file, buf);
-      pos := pos + amt;
-    end loop;
-    utl_file.fclose(file);
-  end;
   
-  procedure write_file (
-    p_hdl        in cdf_handle
-  , p_directory  in varchar2
-  , p_filename   in varchar2 
+  function get_file (
+    p_hdl  in cdf_handle
   )
+  return blob
   is
     file                     cdf_file_t := cdf_cache(p_hdl);
     
@@ -1506,9 +1478,49 @@ create or replace package body xutl_cdf is
       write(header_writer, to_bytes(file.header.difat(i)));
     end loop;
     
+    return output;
+
+  end;
+
+  procedure write_blob (
+    p_directory  in varchar2
+  , p_filename   in varchar2
+  , p_content    in blob
+  )
+  is
+    MAX_BUF_SIZE  constant pls_integer := 32767;
+    file       utl_file.file_type;
+    pos        integer := 1;
+    chunkSize  pls_integer := dbms_lob.getchunksize(p_content);
+    amt        pls_integer := least(trunc(MAX_BUF_SIZE/chunkSize)*chunkSize, MAX_BUF_SIZE);
+    buf        raw(32767);
+  begin
+    file := utl_file.fopen(p_directory, p_filename, 'wb', 32767);
+    loop
+      begin
+        dbms_lob.read(p_content, amt, pos, buf);
+      exception
+        when no_data_found then
+          exit;
+      end;
+      utl_file.put_raw(file, buf);
+      pos := pos + amt;
+    end loop;
+    utl_file.fclose(file);
+  end;
+  
+  procedure write_file (
+    p_hdl        in cdf_handle
+  , p_directory  in varchar2
+  , p_filename   in varchar2 
+  )
+  is
+    output  blob;
+  begin
+    output := get_file(p_hdl);
+    close_file(p_hdl);
     write_blob(p_directory, p_filename, output);
     dbms_lob.freetemporary(output);
-
   end;
 
 end xutl_cdf;

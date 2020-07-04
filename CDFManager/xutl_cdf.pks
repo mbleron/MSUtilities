@@ -60,6 +60,8 @@ create or replace package xutl_cdf is
   
   type entry_list_t is table of entry_t;
   
+  procedure set_debug (p_mode in boolean);
+  
   function is_cdf (p_file in blob) return boolean;
 
   function new_file (p_version in pls_integer default V4) 
@@ -67,6 +69,11 @@ create or replace package xutl_cdf is
   
   function open_file (p_file in blob)
   return cdf_handle;
+  
+  function get_file (
+    p_hdl  in cdf_handle
+  )
+  return blob;
   
   procedure write_file (
     p_hdl        in cdf_handle
@@ -107,7 +114,12 @@ create or replace package xutl_cdf is
   return entry_list_t pipelined;
   
   procedure close_file (p_hdl in cdf_handle);
-  procedure set_debug (p_mode in boolean);
+  
+  procedure write_blob (
+    p_directory  in varchar2
+  , p_filename   in varchar2
+  , p_content    in blob
+  );
 
 end xutl_cdf;
 /
