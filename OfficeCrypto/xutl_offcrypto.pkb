@@ -25,22 +25,31 @@ create or replace package body xutl_offcrypto is
   ERR_KD_ALG        constant varchar2(128) := 'Unsupported key-derivation algorithm : %s';
   ERR_HMAC          constant varchar2(128) := 'Unsupported HMAC algorithm';
 
-  POW16_4           constant integer := 65536; 
-  POW16_8           constant integer := 4294967296;
-  POW16_12          constant integer := 281474976710656;
+  P2_16             constant integer := 65536;
+  P2_31             constant integer := 2147483648;
+  P2_32             constant integer := 4294967296;
+  P2_48             constant integer := 281474976710656;
+
+  type VersionInfo_t is record (
+    vMajor  pls_integer
+  , vMinor  pls_integer
+  , vFull   varchar2(3)
+  );
 
   type StandardEncryptionInfo_t is record (
-    vMajor                 pls_integer
-  , vMinor                 pls_integer
-  , Flags                  raw(1)
+    versionInfo            VersionInfo_t
+  , Flags                  raw(4)
   , fCryptoAPI             boolean
   , fAES                   boolean
   , fExternal              boolean
   , HeaderSize             pls_integer
+  , AlgID_Ext              pls_integer
   , AlgID                  pls_integer
   , AlgIDHash              pls_integer
+  , AlgIDHash_Ext          pls_integer
   , KeySize                pls_integer
   , ProviderType           pls_integer
+  , CSPName                raw(512)
   , SaltSize               pls_integer
   , Salt                   raw(16)
   , EncryptedVerifier      raw(16)
@@ -49,15 +58,24 @@ create or replace package body xutl_offcrypto is
   , EncVerifierHashSize    pls_integer
   );
   
+  type AgileDataIntegrity_t is record (
+    encryptedHmacKey    raw(64)
+  , encryptedHmacValue  raw(64)
+  , hashMacAlg          pls_integer
+  );
+  
   type AgileKeyData_t is record (
-    saltSize     integer
-  , blockSize    integer
-  , keyBits      integer
-  , hashSize     integer
-  , cipherAlg    pls_integer
-  , cipherChain  pls_integer
-  , hashAlg      pls_integer
-  , saltValue    raw(64)
+    saltSize           integer
+  , blockSize          integer
+  , keyBits            integer
+  , hashSize           integer
+  , cipherAlgString    varchar2(16)
+  , cipherAlg          pls_integer
+  , cipherChainString  varchar2(16)
+  , cipherChain        pls_integer
+  , hashAlgString      varchar2(16)
+  , hashAlg            pls_integer
+  , saltValue          raw(64)
   );
   
   type AgileKeyEncryptor_t is record (
@@ -67,22 +85,27 @@ create or replace package body xutl_offcrypto is
   , blockSize             integer
   , keyBits               integer
   , hashSize              integer
+  , cipherAlgString       varchar2(16)
   , cipherAlg             pls_integer
+  , cipherChainString     varchar2(16)
   , cipherChain           pls_integer
+  , hashAlgString         varchar2(16)
   , hashAlg               pls_integer
   , saltValue             raw(64)
   , encVerifierHashInput  raw(64)
   , encVerifierHashValue  raw(64)
   , encryptedKeyValue     raw(64)
+  -- helpers
+  , hashCache             raw(64)
+  , password              varchar2(255)
   );
   
   type AgileEncryptionInfo_t is record (
-    vMajor          pls_integer
-  , vMinor          pls_integer
+    versionInfo     VersionInfo_t
   , XmlDescriptor   blob
   , keyData         AgileKeyData_t
   , keyEncryptor    AgileKeyEncryptor_t
-  , hashCache       raw(64)
+  , dataIntegrity   AgileDataIntegrity_t
   );
   
   type EncryptionVerifier_t is record (
@@ -95,8 +118,7 @@ create or replace package body xutl_offcrypto is
   
   type BinaryRC4EncryptionHeader_t is record (
     wEncryptionType        pls_integer
-  , vMajor                 pls_integer
-  , vMinor                 pls_integer
+  , versionInfo            VersionInfo_t
   , fCryptoAPI             boolean
   -- RC4
   , saltValue              raw(16)
@@ -155,6 +177,46 @@ create or replace package body xutl_offcrypto is
     raise_application_error(errcode, utl_lms.format_message(message, arg1, arg2, arg3));
   end;
 
+  function base64ToBlob (
+    input in varchar2 
+  )
+  return blob
+  is
+  begin
+    return to_blob(utl_encode.base64_decode(utl_raw.cast_to_raw(input)));
+  end;
+  
+  function rawToBase64 (
+    input in raw
+  )
+  return varchar2
+  is
+  begin
+    return translate(utl_raw.cast_to_varchar2(utl_encode.base64_encode(input)), '_'||chr(13)||chr(10), '_');
+  end;
+
+  function to_bytes(n in integer, sz in pls_integer default 4) 
+  return raw
+  is
+    output     raw(8);
+    output_sz  pls_integer := 4;
+  begin
+    
+    if n < P2_31 then
+      output := utl_raw.cast_from_binary_integer(n, utl_raw.little_endian);
+    elsif n < P2_32 then
+      output := utl_raw.cast_from_binary_integer(n - P2_32, utl_raw.little_endian);
+    else
+      output := utl_raw.concat(to_bytes(mod(n, P2_32)), to_bytes(trunc(n / P2_32)));
+      output_sz := 8;
+    end if;
+    
+    return case when output_sz = sz then output
+                when output_sz > sz then utl_raw.substr(output, 1, sz)
+                else utl_raw.overlay(output, utl_raw.copies('00', sz))
+           end;
+  end;
+
   function to_int32 (p_bytes in raw) return pls_integer
   is
   begin
@@ -164,9 +226,9 @@ create or replace package body xutl_offcrypto is
   function to_int64 (bytes in raw) return integer
   is
   begin
-    return utl_raw.cast_to_binary_integer(utl_raw.substr(bytes,7,2), utl_raw.little_endian) * POW16_12
-         + utl_raw.cast_to_binary_integer(utl_raw.substr(bytes,5,2), utl_raw.little_endian) * POW16_8
-         + utl_raw.cast_to_binary_integer(utl_raw.substr(bytes,3,2), utl_raw.little_endian) * POW16_4
+    return utl_raw.cast_to_binary_integer(utl_raw.substr(bytes,7,2), utl_raw.little_endian) * P2_48
+         + utl_raw.cast_to_binary_integer(utl_raw.substr(bytes,5,2), utl_raw.little_endian) * P2_32
+         + utl_raw.cast_to_binary_integer(utl_raw.substr(bytes,3,2), utl_raw.little_endian) * P2_16
          + utl_raw.cast_to_binary_integer(utl_raw.substr(bytes,1,2), utl_raw.little_endian);
   end;
 
@@ -233,6 +295,33 @@ create or replace package body xutl_offcrypto is
       output := dbms_crypto.HASH_SH384;
     when 'SHA512' then
       output := dbms_crypto.HASH_SH512;
+    $END
+    else
+      -- Unsupported hash algorithm : %s
+      error(-20714, ERR_HASH_ALG, p_alg);
+    end case;
+    return output;
+  end;
+
+  function map_HashMacAlg (p_alg in varchar2)
+  return pls_integer
+  is
+    output  pls_integer;
+  begin
+    case p_alg
+    when 'SHA1' then 
+      output := dbms_crypto.HMAC_SH1;
+    when 'MD5' then
+      output := dbms_crypto.HMAC_MD5;
+    -- SHA-2 hash algorithms available starting with Oracle 12
+    $IF DBMS_DB_VERSION.VERSION >= 12 
+    $THEN
+    when 'SHA256' then
+      output := dbms_crypto.HMAC_SH256;
+    when 'SHA384' then
+      output := dbms_crypto.HMAC_SH384;
+    when 'SHA512' then
+      output := dbms_crypto.HMAC_SH512;
     $END
     else
       -- Unsupported hash algorithm : %s
@@ -382,13 +471,12 @@ create or replace package body xutl_offcrypto is
     
     if info.wEncryptionType = 1 then
     
-      info.vMajor := to_int32(readBytes(2));
-      debug('vMajor = '||info.vMajor);
-    
-      info.vMinor := to_int32(readBytes(2));
-      debug('vMinor = '||info.vMinor);
+      info.versionInfo.vMajor := to_int32(readBytes(2));
+      info.versionInfo.vMinor := to_int32(readBytes(2));
+      info.versionInfo.vFull := info.versionInfo.vMajor || '.' || info.versionInfo.vMinor;
+      debug('vFull = '||info.versionInfo.vFull);
        
-      if info.vMajor = 1 and info.vMinor = 1 then
+      if info.versionInfo.vMajor = 1 and info.versionInfo.vMinor = 1 then
     
         -- RC4 encryption header structure - [MS-OFFCRYPTO], 2.3.6.1
         info.fCryptoAPI := false;
@@ -402,7 +490,7 @@ create or replace package body xutl_offcrypto is
         info.encryptedVerifierHash := readBytes(16);
         debug('encryptedVerifierHash = '||info.encryptedVerifierHash);
         
-      elsif info.vMajor in (2,3,4) and info.vMinor = 2 then
+      elsif info.versionInfo.vMajor in (2,3,4) and info.versionInfo.vMinor = 2 then
       
         -- RC4 CryptoAPI Encryption Header - [MS-OFFCRYPTO], 2.3.5.1
         info.fCryptoAPI := true;
@@ -425,7 +513,7 @@ create or replace package body xutl_offcrypto is
       
       else
         
-        error(-20718, ERR_ENC_VERSION, info.vMajor||'.'||info.vMinor);
+        error(-20718, ERR_ENC_VERSION, info.versionInfo.vFull);
       
       end if;
     
@@ -443,9 +531,9 @@ create or replace package body xutl_offcrypto is
   )
   is
   
-    BIT02          constant raw(1) := hextoraw('04');
-    BIT05          constant raw(1) := hextoraw('20');
-    BIT04          constant raw(1) := hextoraw('10');
+    BIT02          constant raw(4) := hextoraw('04000000');
+    BIT04          constant raw(4) := hextoraw('10000000');
+    BIT05          constant raw(4) := hextoraw('20000000');
 
     tmp_AlgID      pls_integer;
     tmp_AlgIDHash  pls_integer;
@@ -454,7 +542,7 @@ create or replace package body xutl_offcrypto is
   begin
     
     info.HeaderSize   := to_int32(dbms_lob.substr(stream, 4, 9));
-    info.Flags        := dbms_lob.substr(stream, 1, 12+1);
+    info.Flags        := dbms_lob.substr(stream, 4, 12+1);
     tmp_AlgID         := to_int32(dbms_lob.substr(stream, 4, 12+9));
     tmp_AlgIDHash     := to_int32(dbms_lob.substr(stream, 4, 12+13));
     info.KeySize      := to_int32(dbms_lob.substr(stream, 4, 12+17))/8;
@@ -472,8 +560,8 @@ create or replace package body xutl_offcrypto is
     end case;
     
     info.fCryptoAPI   := ( utl_raw.bit_and(info.Flags, BIT02) = BIT02 );
-    info.fAES         := ( utl_raw.bit_and(info.Flags, BIT05) = BIT05 );
     info.fExternal    := ( utl_raw.bit_and(info.Flags, BIT04) = BIT04 );
+    info.fAES         := ( utl_raw.bit_and(info.Flags, BIT05) = BIT05 );
     
     offset := 12 + info.HeaderSize + 1;
     
@@ -921,23 +1009,19 @@ create or replace package body xutl_offcrypto is
     
   end;
   
-  function get_key_standard (
-    info     in out nocopy StandardEncryptionInfo_t
+  function standardEncryptionKey (
+    info     in StandardEncryptionInfo_t
   , password in varchar2
-  , validate in boolean default true
   )
   return raw
   is
-  
     hdata           raw(64);
     x1              raw(64) := utl_raw.copies(hextoraw('36'),64);
     x2              raw(64) := utl_raw.copies(hextoraw('5C'),64);
     keyDerived      raw(64);
-    verifierHash_1  raw(64);
-    verifierHash_2  raw(64);
-    encType         pls_integer;
-    
   begin
+
+    -- 2.3.4.7 ECMA-376 Document Encryption Key Generation (Standard Encryption)
 
     hdata := dbms_crypto.Hash(utl_raw.concat(info.Salt, utl_i18n.string_to_raw(password,'AL16UTF16LE')), info.AlgIDHash);
     for i in 0 .. 49999 loop
@@ -948,7 +1032,29 @@ create or replace package body xutl_offcrypto is
     x1 := dbms_crypto.Hash(utl_raw.bit_xor(x1, hdata), info.AlgIDHash);
     x2 := dbms_crypto.Hash(utl_raw.bit_xor(x2, hdata), info.AlgIDHash);
     keyDerived := utl_raw.substr(utl_raw.concat(x1,x2), 1, info.keySize);
+    
     debug('keyDerived = '||keyDerived);
+    
+    return keyDerived;
+    
+  end;
+  
+  function get_key_standard (
+    info     in StandardEncryptionInfo_t
+  , password in varchar2
+  , validate in boolean default true
+  )
+  return raw
+  is
+  
+    keyDerived      raw(64);
+    verifierHash_1  raw(64);
+    verifierHash_2  raw(64);
+    encType         pls_integer;
+    
+  begin
+
+    keyDerived := standardEncryptionKey(info, password);
     
     -- 2.3.4.9 Password Verification (Standard Encryption)
     if validate then
@@ -966,6 +1072,33 @@ create or replace package body xutl_offcrypto is
     
     return keyDerived;
     
+  end;
+
+  function agileEncryptionKey (
+    keyEnc    in out nocopy AgileKeyEncryptor_t
+  , blockKey  in raw
+  ) 
+  return raw
+  is
+    hdata    raw(64);
+    keySize  pls_integer := keyEnc.keyBits/8;
+  begin
+      
+    if keyEnc.hashCache is null then
+      hdata := dbms_crypto.Hash(utl_raw.concat(keyEnc.saltValue, utl_i18n.string_to_raw(keyEnc.password,'AL16UTF16LE')), keyEnc.hashAlg);
+      for i in 0 .. keyEnc.spinCount - 1 loop
+        hdata := dbms_crypto.Hash(utl_raw.concat(utl_raw.cast_from_binary_integer(i, utl_raw.little_endian), hdata), keyEnc.hashAlg);
+      end loop;
+      keyEnc.hashCache := hdata;
+    else
+      hdata := keyEnc.hashCache;
+    end if;
+      
+    hdata := dbms_crypto.Hash(utl_raw.concat(hdata, blockKey), keyEnc.hashAlg);
+    adjustSize(hdata, keySize, hextoraw('36'));
+      
+    return hdata;  
+    
   end;  
     
   function get_key_agile (
@@ -976,7 +1109,7 @@ create or replace package body xutl_offcrypto is
   return raw
   is
   
-    hdata                 raw(64);
+    
     keyValueDecryptorKey  raw(64);
     verifierInputKey      raw(64);
     verifierHashKey       raw(64);   
@@ -985,44 +1118,24 @@ create or replace package body xutl_offcrypto is
     decKeyValue           raw(64);    
     verifierHash_1        raw(64);
     verifierHash_2        raw(64);
-    keySize               pls_integer := info.keyEncryptor.keyBits/8;
+    
     encType               pls_integer;
-    
-    function generateKey (blockKey in raw) return raw
-    is
-    begin
-      
-      if info.hashCache is null then
-        hdata := dbms_crypto.Hash(utl_raw.concat(info.keyEncryptor.saltValue, utl_i18n.string_to_raw(password,'AL16UTF16LE')), info.keyEncryptor.hashAlg);
-        for i in 0 .. info.keyEncryptor.spinCount - 1 loop
-          hdata := dbms_crypto.Hash(utl_raw.concat(utl_raw.cast_from_binary_integer(i, utl_raw.little_endian), hdata), info.keyEncryptor.hashAlg);
-        end loop;
-        info.hashCache := hdata;
-      else
-        hdata := info.hashCache;
-      end if;
-      
-      hdata := dbms_crypto.Hash(utl_raw.concat(hdata, blockKey), info.keyEncryptor.hashAlg);
-      adjustSize(hdata, keySize, hextoraw('36'));
-      
-      return hdata;  
-    
-    end;
 
   begin
 
+    info.keyEncryptor.password := password;
     encType := info.keyEncryptor.cipherAlg + info.keyEncryptor.cipherChain + dbms_crypto.PAD_ZERO;
     
     if validate then
     
       -- blockKey from 2.3.4.13 #encryptedKeyValue
-      keyValueDecryptorKey := generateKey(hextoraw('146E0BE7ABACD0D6'));
+      keyValueDecryptorKey := agileEncryptionKey(info.keyEncryptor, hextoraw('146E0BE7ABACD0D6'));
       debug('keyValueDecryptorKey = '||keyValueDecryptorKey);
       -- blockKey from 2.3.4.13 #encryptedVerifierHashInput
-      verifierInputKey := generateKey(hextoraw('FEA7D2763B4B9E79'));
+      verifierInputKey := agileEncryptionKey(info.keyEncryptor, hextoraw('FEA7D2763B4B9E79'));
       debug('verifierInputKey = '||verifierInputKey);
       -- blockKey from 2.3.4.13 #encryptedVerifierHashValue
-      verifierHashKey := generateKey(hextoraw('D7AA0F6D3061344E'));
+      verifierHashKey := agileEncryptionKey(info.keyEncryptor, hextoraw('D7AA0F6D3061344E'));
       debug('verifierHashKey = '||verifierHashKey);
       
       decVerifierHashInput := 
@@ -1064,6 +1177,275 @@ create or replace package body xutl_offcrypto is
     debug('decryptedKeyValue = '||decKeyValue);    
     return decKeyValue;
 
+  end;
+
+  function get_DS_StrongEncryptionDataSpc
+  return blob
+  is
+  begin
+    return base64ToBlob('CAAAAAEAAAAyAAAAUwB0AHIAbwBuAGcARQBuAGMAcgB5AHAAdABpAG8AbgBUAHIA
+YQBuAHMAZgBvAHIAbQAAAA==');
+  end;
+  
+  function get_DS_DataSpaceMap
+  return blob
+  is
+  begin
+    return base64ToBlob('CAAAAAEAAABoAAAAAQAAAAAAAAAgAAAARQBuAGMAcgB5AHAAdABlAGQAUABhAGMA
+awBhAGcAZQAyAAAAUwB0AHIAbwBuAGcARQBuAGMAcgB5AHAAdABpAG8AbgBEAGEA
+dABhAFMAcABhAGMAZQAAAA==');
+  end;
+
+  function get_DS_StrongEncryptionTrnsfrm
+  return blob
+  is
+  begin
+    return base64ToBlob('WAAAAAEAAABMAAAAewBGAEYAOQBBADMARgAwADMALQA1ADYARQBGAC0ANAA2ADEA
+MwAtAEIARABEADUALQA1AEEANAAxAEMAMQBEADAANwAyADQANgB9AE4AAABNAGkA
+YwByAG8AcwBvAGYAdAAuAEMAbwBuAHQAYQBpAG4AZQByAC4ARQBuAGMAcgB5AHAA
+dABpAG8AbgBUAHIAYQBuAHMAZgBvAHIAbQAAAAEAAAABAAAAAQAAAAAAAAAAAAAA
+AAAAAAQAAAA=');
+  end;
+
+  function get_DS_Version
+  return blob
+  is
+  begin
+    return base64ToBlob('PAAAAE0AaQBjAHIAbwBzAG8AZgB0AC4AQwBvAG4AdABhAGkAbgBlAHIALgBEAGEA
+dABhAFMAcABhAGMAZQBzAAEAAAABAAAAAQAAAA==');
+  end;
+
+  procedure write_AgileXmlDesc
+  is
+    versionInfo  VersionInfo_t;
+    keyData      AgileKeyData_t;
+    keyEnc       AgileKeyEncryptor_t;
+    dataInt      AgileDataIntegrity_t;
+    
+    encType  pls_integer;
+    
+    encryptionKey  raw(64);
+    verifierInput  raw(16);
+    
+    xmlDescriptor   blob;
+    encInfo         blob;
+    
+    input        blob;
+    output       blob;
+    amount       pls_integer;
+    offset       integer := 1;
+    buffer       raw(4096);
+    ciphertext   raw(4096);  
+    iv           raw(64);
+    inputSize    integer;
+    
+    hmacKeyInput    raw(64);
+    
+    cdf          xutl_cdf.cdf_handle;
+    
+  begin
+    
+    versionInfo.vMajor := 4;
+    versionInfo.vMinor := 4;
+    
+    keyData.saltSize := 16;
+    keyData.blockSize := 16; -- AES block size
+    keyData.keyBits := 256;  -- key size
+    keyData.hashSize := 64;  -- SHA512
+    keyData.cipherAlgString := 'AES';
+    keyData.cipherAlg := map_CipherAlg(keyData.cipherAlgString, keyData.keyBits);
+    keyData.cipherChainString := 'ChainingModeCBC';
+    keyData.cipherChain := map_CipherChainMode(keyData.cipherChainString);
+    keyData.hashAlgString := 'SHA512';
+    keyData.hashAlg := map_HashAlg(keyData.hashAlgString);
+    keyData.saltValue := dbms_crypto.RandomBytes(keyData.saltSize);
+    
+    keyEnc.uri := 'http://schemas.microsoft.com/office/2006/keyEncryptor/password';
+    keyEnc.spinCount := 100000;
+    keyEnc.saltSize := 16;
+    keyEnc.blockSize := 16;
+    keyEnc.keyBits := 256;
+    keyEnc.hashSize := 64;
+    keyEnc.cipherAlgString := 'AES';
+    keyEnc.cipherAlg := map_CipherAlg(keyEnc.cipherAlgString, keyEnc.keyBits);
+    keyEnc.cipherChainString := 'ChainingModeCBC';
+    keyEnc.cipherChain := map_CipherChainMode(keyEnc.cipherChainString);
+    keyEnc.hashAlgString := 'SHA512';
+    keyEnc.hashAlg := map_HashAlg(keyEnc.hashAlgString);
+    keyEnc.saltValue := dbms_crypto.RandomBytes(keyEnc.saltSize);
+    
+    keyEnc.password := 'pass123';
+    encType := keyEnc.cipherAlg + keyEnc.cipherChain + dbms_crypto.PAD_ZERO;
+    dataInt.hashMacAlg := map_HashMacAlg('SHA512');
+    
+    -- 2.3.4.13 #encryptedVerifierHashInput
+    verifierInput := dbms_crypto.RandomBytes(keyEnc.saltSize);
+    
+    keyEnc.encVerifierHashInput := 
+    dbms_crypto.encrypt(
+      src => verifierInput
+    , typ => encType
+    , key => agileEncryptionKey(keyEnc, hextoraw('FEA7D2763B4B9E79'))
+    , iv  => keyEnc.saltValue
+    );
+    
+    debug('encryptedVerifierHashInput = '||keyEnc.encVerifierHashInput);
+    
+    -- 2.3.4.13 #encryptedVerifierHashValue
+    keyEnc.encVerifierHashValue :=
+    dbms_crypto.encrypt(
+      src => dbms_crypto.Hash(verifierInput, keyEnc.hashAlg)
+    , typ => encType
+    , key => agileEncryptionKey(keyEnc, hextoraw('D7AA0F6D3061344E'))
+    , iv  => keyEnc.saltValue
+    );
+    
+    debug('encryptedVerifierHashValue = '||keyEnc.encVerifierHashValue);
+    
+    -- 2.3.4.13 #encryptedKeyValue
+    encryptionKey := dbms_crypto.RandomBytes(keyData.keyBits/8);
+    
+    keyEnc.encryptedKeyValue :=
+    dbms_crypto.encrypt(
+      src => encryptionKey
+    , typ => encType
+    , key => agileEncryptionKey(keyEnc, hextoraw('146E0BE7ABACD0D6'))
+    , iv  => keyEnc.saltValue
+    );
+    
+    debug('encryptedKeyValue = '||keyEnc.encryptedKeyValue);
+    
+    
+    input := file2blob('XL_DATA_DIR', 'sample_1.xlsx');
+    inputSize := dbms_lob.getlength(input);
+    amount := 4096;
+    dbms_lob.createtemporary(output, true);
+    
+    -- unencrypted package size
+    dbms_lob.writeappend(output, 8, to_bytes(inputSize, 8));
+    
+    -- 2.3.4.15
+    for i in 0 .. ceil(inputSize/4096) - 1 loop
+      
+      dbms_lob.read(input, amount, offset, buffer);
+      debug('['||i||'] amount read = '||amount);
+      offset := offset + amount;
+      
+      -- 2.3.4.12 IV Generation
+      iv := dbms_crypto.Hash(
+              utl_raw.concat(keyData.saltValue, utl_raw.cast_from_binary_integer(i, utl_raw.little_endian))
+            , keyData.hashAlg
+            );
+            
+      adjustSize(iv, keyData.blockSize, hextoraw('36'));
+      
+      ciphertext := dbms_crypto.Encrypt(
+                 buffer
+               , encType
+               , encryptionKey
+               , iv
+               );
+      
+      dbms_lob.writeappend(output, utl_raw.length(ciphertext), ciphertext);
+    
+    end loop;
+    
+    -- 2.3.4.14 DataIntegrity Generation
+    hmacKeyInput := dbms_crypto.RandomBytes(keyData.hashSize);
+    
+    dataInt.encryptedHmacKey := 
+    dbms_crypto.Encrypt(
+      src => hmacKeyInput
+    , typ => encType
+    , key => encryptionKey
+    , iv  => dbms_crypto.Hash(utl_raw.concat(keyData.saltValue, '5FB2AD010CB9E1F6'), keyData.hashAlg)
+    );
+    
+    dataInt.encryptedHmacValue := 
+    dbms_crypto.Encrypt(
+      src => dbms_crypto.Mac(
+               src => output
+             , typ => dataInt.hashMacAlg
+             , key => hmacKeyInput
+             )
+    , typ => encType
+    , key => encryptionKey
+    , iv  => dbms_crypto.Hash(utl_raw.concat(keyData.saltValue, 'A0677F02B22C8433'), keyData.hashAlg)
+    );   
+    
+    
+    select xmlserialize(document
+             xmlelement("encryption"
+             , xmlattributes(
+                 'http://schemas.microsoft.com/office/2006/encryption' as "xmlns"
+               , 'http://schemas.microsoft.com/office/2006/keyEncryptor/password' as "xmlns:p"
+               )
+             , xmlelement("keyData"
+               , xmlattributes(
+                   keyData.saltSize as "saltSize"
+                 , keyData.blockSize as "blockSize"
+                 , keyData.keyBits as "keyBits"
+                 , keyData.hashSize as "hashSize"
+                 , keyData.cipherAlgString as "cipherAlgorithm"
+                 , keyData.cipherChainString as "cipherChaining"
+                 , keyData.hashAlgString as "hashAlgorithm"
+                 , utl_raw.cast_to_varchar2(utl_encode.base64_encode(keyData.saltValue)) as "saltValue"
+                 )
+               )
+             , xmlelement("dataIntegrity"
+               , xmlattributes(
+                   rawToBase64(dataInt.encryptedHmacKey) as "encryptedHmacKey"
+                 , rawToBase64(dataInt.encryptedHmacValue) as "encryptedHmacValue"
+                 )
+               )
+             , xmlelement("keyEncryptors"
+               , xmlelement("keyEncryptor"
+                 , xmlattributes(keyEnc.uri as "uri")
+                 , xmlelement("p:encryptedKey"
+                   , xmlattributes(
+                       keyEnc.spinCount as "spinCount"
+                     , keyEnc.saltSize as "saltSize"
+                     , keyEnc.blockSize as "blockSize"
+                     , keyEnc.keyBits as "keyBits"
+                     , keyEnc.hashSize as "hashSize"
+                     , keyEnc.cipherAlgString as "cipherAlgorithm"
+                     , keyEnc.cipherChainString as "cipherChaining"
+                     , keyEnc.hashAlgString as "hashAlgorithm"
+                     , rawToBase64(keyEnc.saltValue) as "saltValue"
+                     , rawToBase64(keyEnc.encVerifierHashInput) as "encryptedVerifierHashInput"
+                     , rawToBase64(keyEnc.encVerifierHashValue) as "encryptedVerifierHashValue"
+                     , rawToBase64(keyEnc.encryptedKeyValue) as "encryptedKeyValue"
+                     )
+                   )
+                 )
+               )
+             )
+             as blob encoding 'UTF-8' no indent
+           )
+    into xmlDescriptor
+    from dual;
+    
+    --dbms_output.put_line(xmlDescriptor.getClobVal(1,2));
+    
+    dbms_lob.createtemporary(encInfo, true);
+    dbms_lob.writeappend(encInfo, 2, to_bytes(versionInfo.vMajor, 2));
+    dbms_lob.writeappend(encInfo, 2, to_bytes(versionInfo.vMinor, 2));
+    dbms_lob.writeappend(encInfo, 4, '40000000'); -- reserved
+    dbms_lob.copy(encInfo, xmlDescriptor, dbms_lob.getlength(xmlDescriptor), 9);  
+    
+    cdf := xutl_cdf.new_file;
+        
+    xutl_cdf.add_stream(cdf, '/'||chr(6)||'DataSpaces/DataSpaceInfo/StrongEncryptionDataSpace', get_DS_StrongEncryptionDataSpc);
+
+    xutl_cdf.add_stream(cdf, '/'||chr(6)||'DataSpaces/DataSpaceMap', get_DS_DataSpaceMap);
+    xutl_cdf.add_stream(cdf, '/'||chr(6)||'DataSpaces/TransformInfo/StrongEncryptionTransform/'||chr(6)||'Primary', get_DS_StrongEncryptionTrnsfrm);
+    xutl_cdf.add_stream(cdf, '/'||chr(6)||'DataSpaces/Version', get_DS_Version);
+    xutl_cdf.add_stream(cdf, '/EncryptedPackage', output);
+    xutl_cdf.add_stream(cdf, '/EncryptionInfo', encInfo);
+    
+    xutl_cdf.write_file(cdf, 'TEST_DIR', 'sample_1_enc.xlsx');
+    xutl_cdf.close_file(cdf);
+    
   end;
   
   function get_pack_standard (
@@ -1182,13 +1564,10 @@ create or replace package body xutl_offcrypto is
   )
   return blob 
   is
-    stream1  blob;
-    stream2  blob;
-    output   blob;
-    vMajor   pls_integer;
-    vMinor   pls_integer;
-    vFull    varchar2(10);
-    
+    stream1      blob;
+    stream2      blob;
+    output       blob;
+    versionInfo  VersionInfo_t;
   begin
     stream1 := xutl_cdf.get_stream(p_cdf_hdl, '/EncryptionInfo');
     stream2 := xutl_cdf.get_stream(p_cdf_hdl, '/EncryptedPackage');
@@ -1197,21 +1576,21 @@ create or replace package body xutl_offcrypto is
       xutl_cdf.close_file(p_cdf_hdl);
     end if;
     
-    vMajor := to_int32(dbms_lob.substr(stream1, 2, 1));
-    vMinor := to_int32(dbms_lob.substr(stream1, 2, 3));
-    vFull := to_char(vMajor)||'.'||to_char(vMinor);
-    debug('Encryption version = '||vFull);
+    versionInfo.vMajor := to_int32(dbms_lob.substr(stream1, 2, 1));
+    versionInfo.vMinor := to_int32(dbms_lob.substr(stream1, 2, 3));
+    versionInfo.vFull := to_char(versionInfo.vMajor)||'.'||to_char(versionInfo.vMinor);
+    debug('Encryption version = '||versionInfo.vFull);
     
     -- vMajor = 3 : Office 2007 SP1
-    -- vMajor = 4 : Office 2007 SP2, 2010, 2013 
+    -- vMajor = 4 : Office 2007 SP2, 2010, 2013, 2016 
     -- vMinor = 3 : extensible encryption
-    if vMajor in (3,4) and vMinor = 2 then
+    if versionInfo.vMajor in (3,4) and versionInfo.vMinor = 2 then
       output := get_pack_standard(stream1, stream2, p_password);
-    elsif vMajor = 4 and vMinor = 4 then
+    elsif versionInfo.vMajor = 4 and versionInfo.vMinor = 4 then
       output := get_pack_agile(stream1, stream2, p_password);
     else
       -- Unsupported encryption version : %s
-      error(-20718, ERR_ENC_VERSION, vFull);
+      error(-20718, ERR_ENC_VERSION, versionInfo.vFull);
     end if;
     
     return output;
@@ -1231,6 +1610,411 @@ create or replace package body xutl_offcrypto is
     end if;
     hdl := xutl_cdf.open_file(p_file);
     return get_package(hdl, p_password);
+  end;
+
+  function make_cdf (
+    encryptionInfo    in blob
+  , encryptedPackage  in blob
+  )
+  return blob
+  is
+    cdf     xutl_cdf.cdf_handle;
+    output  blob;
+  begin
+    cdf := xutl_cdf.new_file;
+    -- default DataSpaces streams
+    xutl_cdf.add_stream(cdf, '/'||chr(6)||'DataSpaces/DataSpaceInfo/StrongEncryptionDataSpace', get_DS_StrongEncryptionDataSpc);
+    xutl_cdf.add_stream(cdf, '/'||chr(6)||'DataSpaces/DataSpaceMap', get_DS_DataSpaceMap);
+    xutl_cdf.add_stream(cdf, '/'||chr(6)||'DataSpaces/TransformInfo/StrongEncryptionTransform/'||chr(6)||'Primary', get_DS_StrongEncryptionTrnsfrm);
+    xutl_cdf.add_stream(cdf, '/'||chr(6)||'DataSpaces/Version', get_DS_Version);
+    -- 
+    xutl_cdf.add_stream(cdf, '/EncryptionInfo', encryptionInfo);
+    xutl_cdf.add_stream(cdf, '/EncryptedPackage', encryptedPackage);
+    output := xutl_cdf.get_file(cdf);
+    xutl_cdf.close_file(cdf);    
+    return output;
+  end;
+
+  function encrypt_pack_standard (
+    p_package     in blob
+  , p_password    in varchar2
+  , p_version     in VersionInfo_t
+  --, p_cipher      in varchar2
+  --, p_hash        in varchar2
+  )
+  return blob
+  is
+    
+    encInfo           StandardEncryptionInfo_t;
+    keyDerived        raw(64);
+    encType           pls_integer;
+    verifier          raw(16);
+    
+    encryptedPackage  blob;
+    encPackStream     blob;
+    encInfoStream     blob;
+    
+  begin
+    
+    encInfo.versionInfo := p_version;
+    encInfo.fCryptoAPI := true;
+    encInfo.fAES := true;
+    encInfo.fExternal := false;
+    encInfo.Flags := to_bytes(
+                       case when encInfo.fCryptoAPI then 4  else 0 end
+                     + case when encInfo.fExternal  then 16 else 0 end
+                     + case when encInfo.fAES       then 32 else 0 end
+                     );
+                     
+    
+    encInfo.AlgID_Ext := AES128;
+    encInfo.AlgID := dbms_crypto.ENCRYPT_AES128;
+    encInfo.AlgIDHash_Ext := HASH_SHA1;
+    encInfo.AlgIDHash := dbms_crypto.HASH_SH1;
+    encInfo.KeySize := 16;  -- key size in bytes
+    encInfo.ProviderType := PROVIDER_AES;
+    encInfo.CSPName := utl_i18n.string_to_raw('Microsoft Enhanced RSA and AES Cryptographic Provider' || chr(0), 'AL16UTF16LE');
+    
+    encInfo.HeaderSize := 4 * 8 -- Flags, SizeExtra, AlgID, AlgIDHash, KeySize, ProviderType, Reserved1, Reserved2
+                        + utl_raw.length(encInfo.CSPName);
+                        
+    -- 2.3.3 EncryptionVerifier
+    encInfo.SaltSize := 16;
+    encInfo.Salt := dbms_crypto.RandomBytes(encInfo.SaltSize);
+    
+    keyDerived := standardEncryptionKey(encInfo, p_password);
+    
+    encType := encInfo.AlgID + dbms_crypto.CHAIN_ECB + dbms_crypto.PAD_ZERO;
+
+    verifier := dbms_crypto.RandomBytes(16);
+    encInfo.EncryptedVerifier := dbms_crypto.encrypt(verifier, encType, keyDerived);
+    encInfo.VerifierHashSize := 20; -- SHA-1
+    encInfo.EncryptedVerifierHash := dbms_crypto.encrypt(
+                                       src => dbms_crypto.hash(verifier, encInfo.AlgIDHash)
+                                     , typ => encType
+                                     , key => keyDerived
+                                     );
+    
+    -- ------------------------------------------------------
+    --  EncryptedPackage stream
+    -- ------------------------------------------------------
+    dbms_lob.createtemporary(encryptedPackage, true);
+   
+    dbms_crypto.encrypt(
+      dst => encryptedPackage
+    , src => p_package
+    , typ => encType
+    , key => keyDerived
+    );
+    
+    dbms_lob.createtemporary(encPackStream, true);
+    dbms_lob.writeappend(encPackStream, 8, to_bytes(dbms_lob.getlength(p_package), 8));
+    dbms_lob.copy(encPackStream, encryptedPackage, dbms_lob.getlength(encryptedPackage), 9);
+    dbms_lob.freetemporary(encryptedPackage);
+    
+    -- ------------------------------------------------------
+    --  EncryptionInfo stream
+    -- ------------------------------------------------------
+    dbms_lob.createtemporary(encInfoStream, true);
+    
+    dbms_lob.writeappend(encInfoStream, 2, to_bytes(encInfo.versionInfo.vMajor, 2));
+    dbms_lob.writeappend(encInfoStream, 2, to_bytes(encInfo.versionInfo.vMinor, 2));
+    dbms_lob.writeappend(encInfoStream, 4, encInfo.Flags);
+    dbms_lob.writeappend(encInfoStream, 4, to_bytes(encInfo.HeaderSize));
+    -- EncryptionHeader
+    dbms_lob.writeappend(encInfoStream, 4, encInfo.Flags);
+    dbms_lob.writeappend(encInfoStream, 4, '00000000'); -- SizeExtra
+    dbms_lob.writeappend(encInfoStream, 4, to_bytes(encInfo.AlgID_Ext));
+    dbms_lob.writeappend(encInfoStream, 4, to_bytes(encInfo.AlgIDHash_Ext));
+    dbms_lob.writeappend(encInfoStream, 4, to_bytes(encInfo.KeySize * 8)); -- key size in bits
+    dbms_lob.writeappend(encInfoStream, 4, to_bytes(encInfo.ProviderType));
+    dbms_lob.writeappend(encInfoStream, 4, '00000000');  -- Reserved1
+    dbms_lob.writeappend(encInfoStream, 4, '00000000');  -- Reserved2
+    dbms_lob.writeappend(encInfoStream, utl_raw.length(encInfo.CSPName), encInfo.CSPName);
+    -- EncryptionVerifier
+    dbms_lob.writeappend(encInfoStream, 4, to_bytes(encInfo.SaltSize));
+    dbms_lob.writeappend(encInfoStream, encInfo.SaltSize, encInfo.Salt);
+    dbms_lob.writeappend(encInfoStream, utl_raw.length(encInfo.EncryptedVerifier), encInfo.EncryptedVerifier);
+    dbms_lob.writeappend(encInfoStream, 4, to_bytes(encInfo.VerifierHashSize));
+    dbms_lob.writeappend(encInfoStream, utl_raw.length(encInfo.EncryptedVerifierHash), encInfo.EncryptedVerifierHash);
+    
+    return make_cdf(encInfoStream, encPackStream);
+    
+  end;
+  
+  function encrypt_pack_agile (
+    p_package     in blob
+  , p_password    in varchar2
+  , p_version     in VersionInfo_t
+  , p_cipher      in varchar2
+  , p_hash        in varchar2
+  )
+  return blob
+  is
+    keyData        AgileKeyData_t;
+    keyEnc         AgileKeyEncryptor_t;
+    dataInt        AgileDataIntegrity_t;
+    
+    encType        pls_integer;
+    
+    encryptionKey  raw(64);
+    verifierInput  raw(16);
+    
+    xmlDescriptor  blob;
+    encInfoStream  blob;
+    encPackStream  blob;
+    amount         pls_integer;
+    offset         integer := 1;
+    buffer         raw(4096);
+    ciphertext     raw(4096);  
+    iv             raw(64);
+    inputSize      integer;
+    
+    hmacKeyInput   raw(64);
+    
+  begin
+    -- allowed cipher algorithm
+    if p_cipher not in ('AES128','AES256') then
+      error(-20713, ERR_CIPHER_ALG, p_cipher);
+    end if;
+    
+    -- allowed hash algorithm
+    if p_hash not in ('SHA1','SHA512') then
+      error(-20714, ERR_HASH_ALG, p_hash);
+    end if;
+    
+    keyData.cipherAlgString := 'AES';
+    keyData.saltSize := 16;
+    keyData.blockSize := 16; -- AES block size
+    
+    keyEnc.cipherAlgString := 'AES';
+    keyEnc.saltSize := 16;
+    keyEnc.blockSize := 16;
+    
+    case p_cipher
+    when 'AES128' then
+      keyData.keyBits := 128;
+      keyEnc.keyBits := 128;
+    when 'AES256' then
+      keyData.keyBits := 256;
+      keyEnc.keyBits := 256;
+    end case;
+    
+    keyData.cipherAlg := map_CipherAlg(keyData.cipherAlgString, keyData.keyBits);
+    keyEnc.cipherAlg := map_CipherAlg(keyEnc.cipherAlgString, keyEnc.keyBits);
+    
+    case p_hash
+    when 'SHA1' then
+      keyData.hashSize := 20;
+      keyEnc.hashSize := 20;      
+    when 'SHA512' then
+      keyData.hashSize := 64;
+      keyEnc.hashSize := 64;
+    end case;
+    
+    keyData.hashAlgString := p_hash;
+    keyData.hashAlg := map_HashAlg(keyData.hashAlgString);
+    keyEnc.hashAlgString := p_hash;
+    keyEnc.hashAlg := map_HashAlg(keyEnc.hashAlgString);
+    
+    dataInt.hashMacAlg := map_HashMacAlg(keyData.hashAlgString);
+    
+    keyData.cipherChainString := 'ChainingModeCBC';
+    keyData.cipherChain := map_CipherChainMode(keyData.cipherChainString);
+    keyEnc.cipherChainString := 'ChainingModeCBC';
+    keyEnc.cipherChain := map_CipherChainMode(keyEnc.cipherChainString);    
+
+    keyData.saltValue := dbms_crypto.RandomBytes(keyData.saltSize);
+    
+    keyEnc.uri := 'http://schemas.microsoft.com/office/2006/keyEncryptor/password';
+    keyEnc.spinCount := 100000;
+    keyEnc.saltValue := dbms_crypto.RandomBytes(keyEnc.saltSize);
+    
+    keyEnc.password := p_password;
+    encType := keyEnc.cipherAlg + keyEnc.cipherChain + dbms_crypto.PAD_ZERO;
+    
+    -- 2.3.4.13 #encryptedVerifierHashInput
+    verifierInput := dbms_crypto.RandomBytes(keyEnc.saltSize);
+    
+    keyEnc.encVerifierHashInput := 
+    dbms_crypto.encrypt(
+      src => verifierInput
+    , typ => encType
+    , key => agileEncryptionKey(keyEnc, hextoraw('FEA7D2763B4B9E79'))
+    , iv  => keyEnc.saltValue
+    );
+    
+    debug('encryptedVerifierHashInput = '||keyEnc.encVerifierHashInput);
+    
+    -- 2.3.4.13 #encryptedVerifierHashValue
+    keyEnc.encVerifierHashValue :=
+    dbms_crypto.encrypt(
+      src => dbms_crypto.Hash(verifierInput, keyEnc.hashAlg)
+    , typ => encType
+    , key => agileEncryptionKey(keyEnc, hextoraw('D7AA0F6D3061344E'))
+    , iv  => keyEnc.saltValue
+    );
+    
+    debug('encryptedVerifierHashValue = '||keyEnc.encVerifierHashValue);
+    
+    -- 2.3.4.13 #encryptedKeyValue
+    encryptionKey := dbms_crypto.RandomBytes(keyData.keyBits/8);
+    
+    keyEnc.encryptedKeyValue :=
+    dbms_crypto.encrypt(
+      src => encryptionKey
+    , typ => encType
+    , key => agileEncryptionKey(keyEnc, hextoraw('146E0BE7ABACD0D6'))
+    , iv  => keyEnc.saltValue
+    );
+    
+    debug('encryptedKeyValue = '||keyEnc.encryptedKeyValue);
+    
+    inputSize := dbms_lob.getlength(p_package);
+    amount := 4096;
+    dbms_lob.createtemporary(encPackStream, true);
+    
+    -- unencrypted package size
+    dbms_lob.writeappend(encPackStream, 8, to_bytes(inputSize, 8));
+    
+    -- 2.3.4.15
+    for i in 0 .. ceil(inputSize/4096) - 1 loop
+      
+      dbms_lob.read(p_package, amount, offset, buffer);
+      debug('['||i||'] amount read = '||amount);
+      offset := offset + amount;
+      
+      -- 2.3.4.12 IV Generation
+      iv := dbms_crypto.Hash(
+              utl_raw.concat(keyData.saltValue, utl_raw.cast_from_binary_integer(i, utl_raw.little_endian))
+            , keyData.hashAlg
+            );
+            
+      adjustSize(iv, keyData.blockSize, hextoraw('36'));
+      
+      ciphertext := dbms_crypto.Encrypt(
+                      buffer
+                    , encType
+                    , encryptionKey
+                    , iv
+                    );
+      
+      dbms_lob.writeappend(encPackStream, utl_raw.length(ciphertext), ciphertext);
+    
+    end loop;
+    
+    -- 2.3.4.14 DataIntegrity Generation
+    hmacKeyInput := dbms_crypto.RandomBytes(keyData.hashSize);
+    
+    dataInt.encryptedHmacKey := 
+    dbms_crypto.Encrypt(
+      src => hmacKeyInput
+    , typ => encType
+    , key => encryptionKey
+    , iv  => dbms_crypto.Hash(utl_raw.concat(keyData.saltValue, '5FB2AD010CB9E1F6'), keyData.hashAlg)
+    );
+    
+    dataInt.encryptedHmacValue := 
+    dbms_crypto.Encrypt(
+      src => dbms_crypto.Mac(
+               src => encPackStream
+             , typ => dataInt.hashMacAlg
+             , key => hmacKeyInput
+             )
+    , typ => encType
+    , key => encryptionKey
+    , iv  => dbms_crypto.Hash(utl_raw.concat(keyData.saltValue, 'A0677F02B22C8433'), keyData.hashAlg)
+    );   
+    
+    select xmlserialize(document
+             xmlelement("encryption"
+             , xmlattributes(
+                 'http://schemas.microsoft.com/office/2006/encryption' as "xmlns"
+               , 'http://schemas.microsoft.com/office/2006/keyEncryptor/password' as "xmlns:p"
+               )
+             , xmlelement("keyData"
+               , xmlattributes(
+                   keyData.saltSize as "saltSize"
+                 , keyData.blockSize as "blockSize"
+                 , keyData.keyBits as "keyBits"
+                 , keyData.hashSize as "hashSize"
+                 , keyData.cipherAlgString as "cipherAlgorithm"
+                 , keyData.cipherChainString as "cipherChaining"
+                 , keyData.hashAlgString as "hashAlgorithm"
+                 , utl_raw.cast_to_varchar2(utl_encode.base64_encode(keyData.saltValue)) as "saltValue"
+                 )
+               )
+             , xmlelement("dataIntegrity"
+               , xmlattributes(
+                   rawToBase64(dataInt.encryptedHmacKey) as "encryptedHmacKey"
+                 , rawToBase64(dataInt.encryptedHmacValue) as "encryptedHmacValue"
+                 )
+               )
+             , xmlelement("keyEncryptors"
+               , xmlelement("keyEncryptor"
+                 , xmlattributes(keyEnc.uri as "uri")
+                 , xmlelement("p:encryptedKey"
+                   , xmlattributes(
+                       keyEnc.spinCount as "spinCount"
+                     , keyEnc.saltSize as "saltSize"
+                     , keyEnc.blockSize as "blockSize"
+                     , keyEnc.keyBits as "keyBits"
+                     , keyEnc.hashSize as "hashSize"
+                     , keyEnc.cipherAlgString as "cipherAlgorithm"
+                     , keyEnc.cipherChainString as "cipherChaining"
+                     , keyEnc.hashAlgString as "hashAlgorithm"
+                     , rawToBase64(keyEnc.saltValue) as "saltValue"
+                     , rawToBase64(keyEnc.encVerifierHashInput) as "encryptedVerifierHashInput"
+                     , rawToBase64(keyEnc.encVerifierHashValue) as "encryptedVerifierHashValue"
+                     , rawToBase64(keyEnc.encryptedKeyValue) as "encryptedKeyValue"
+                     )
+                   )
+                 )
+               )
+             )
+             as blob encoding 'UTF-8' no indent
+           )
+    into xmlDescriptor
+    from dual;
+    
+    --dbms_output.put_line(xmlDescriptor.getClobVal(1,2));
+    
+    dbms_lob.createtemporary(encInfoStream, true);
+    dbms_lob.writeappend(encInfoStream, 2, to_bytes(p_version.vMajor, 2));
+    dbms_lob.writeappend(encInfoStream, 2, to_bytes(p_version.vMinor, 2));
+    dbms_lob.writeappend(encInfoStream, 4, '40000000'); -- reserved
+    dbms_lob.copy(encInfoStream, xmlDescriptor, dbms_lob.getlength(xmlDescriptor), 9);
+    
+    return make_cdf(encInfoStream, encPackStream);
+    
+  end;
+  
+  function encrypt_package (
+    p_package     in blob
+  , p_password    in varchar2
+  , p_version     in varchar2
+  , p_cipher      in varchar2
+  , p_hash        in varchar2
+  )
+  return blob
+  is
+    output       blob;
+    versionInfo  VersionInfo_t;
+  begin
+    versionInfo.vMajor := substr(p_version, 1, 1);
+    versionInfo.vMinor := substr(p_version, 3, 1);
+    versionInfo.vFull := to_char(versionInfo.vMajor)||'.'||to_char(versionInfo.vMinor);
+    
+    if versionInfo.vMajor in (3,4) and versionInfo.vMinor = 2 then
+      output := encrypt_pack_standard(p_package, p_password, versionInfo /*, p_cipher, p_hash*/);
+    elsif versionInfo.vMajor = 4 and versionInfo.vMinor = 4 then
+      output := encrypt_pack_agile(p_package, p_password, versionInfo, p_cipher, p_hash);
+    else
+      error(-20718, ERR_ENC_VERSION, versionInfo.vFull);
+    end if;
+    
+    return output;
+    
   end;
 
 end xutl_offcrypto;

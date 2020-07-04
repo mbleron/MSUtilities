@@ -3,7 +3,7 @@ create or replace package xutl_offcrypto is
 
   MIT License
 
-  Copyright (c) 2017,2020 Marc Bleron
+  Copyright (c) 2017-2020 Marc Bleron
 
   Permission is hereby granted, free of charge, to any person obtaining a copy
   of this software and associated documentation files (the "Software"), to deal
@@ -29,6 +29,7 @@ create or replace package xutl_offcrypto is
     Marc Bleron       2018-02-03     RC4 routines for .xls files
     Marc Bleron       2018-05-27     Crypto routines for ODF files
     Marc Bleron       2020-03-11     Added RC4 CryptoAPI for .xls files
+    Marc Bleron       2020-06-24     Added encryption routines
 ====================================================================================== */
 
   invalid_cdf               exception;
@@ -64,6 +65,10 @@ create or replace package xutl_offcrypto is
   , fCryptoAPI  boolean
   );
 
+  procedure set_validation (p_mode in boolean);
+  procedure set_debug (p_mode in boolean);
+  function rawToBase64 (input in raw) return varchar2;
+
   function get_key_binary_rc4 (
     keyInfo   in rc4_info_t
   , blockNum  in binary_integer
@@ -96,9 +101,15 @@ create or replace package xutl_offcrypto is
   , password      in varchar2
   )
   return blob;
-  
-  procedure set_validation (p_mode in boolean);
-  procedure set_debug (p_mode in boolean);
+    
+  function encrypt_package (
+    p_package     in blob
+  , p_password    in varchar2
+  , p_version     in varchar2
+  , p_cipher      in varchar2
+  , p_hash        in varchar2
+  )
+  return blob;
 
 end xutl_offcrypto;
 /
